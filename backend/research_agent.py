@@ -9,7 +9,11 @@ from backend.verifier import (
     validate_citations,
     verify_briefing,
 )
-from backend.wikimedia_client import search_wikipedia
+from backend.wikimedia_client import (
+    derive_search_query,
+    is_rate_limit_error,
+    search_wikipedia,
+)
 
 
 class ResearchResult(dict):
@@ -140,15 +144,25 @@ def research_topic(
 
     notify("planning_complete", f"Formulated {len(questions)} research questions.")
 
-    # 2. Search Wikimedia for every research question.
+    # 2. Search Wikimedia for every research question using concise derived queries.
     unique_sources: dict[str, dict] = {}
+    rate_limited_queries: list[str] = []
+    network_error_queries: list[str] = []
+    total_searches = len(questions)
+
     for number, question in enumerate(questions, start=1):
-        notify("retrieval", f"Searching ({number}/{len(questions)}): {question}")
+        query = derive_search_query(question, cleaned_topic)
+        notify("retrieval", f"Searching ({number}/{len(questions)}): {query}")
 
         try:
-            results = search_fn(question, 2)
+            results = search_fn(query, 2)
         except Exception as error:
-            warnings.append(f"Search failed for query '{question}': {error}")
+            if is_rate_limit_error(error):
+                rate_limited_queries.append(query)
+                warnings.append(f"Wikipedia rate limit (HTTP 429) for query '{query}': {error}")
+            else:
+                network_error_queries.append(query)
+                warnings.append(f"Search failed for query '{query}': {error}")
             continue
 
         if not isinstance(results, list):
@@ -183,25 +197,79 @@ def research_topic(
     candidate_sources = list(unique_sources.values())
 
     if not candidate_sources:
-        no_sources_msg = "Stage failed at Retrieval: Could not retrieve usable source material from Wikipedia. Please try another topic."
-        errors.append(no_sources_msg)
-        return ResearchResult({
-            "topic": cleaned_topic,
-            "questions": questions,
-            "sources": [],
-            "briefing": "",
-            "claims": [],
-            "verification_summary": {},
-            "warnings": warnings,
-            "errors": errors,
-            "formatted_report": no_sources_msg,
-            "diagnostics": {
-                "stage_failed": "retrieval",
-                "questions_count": len(questions),
-                "candidates_count": 0,
-                "details": "Wikipedia search returned no usable article extracts across all formulated research questions.",
-            },
-        })
+        if rate_limited_queries and len(rate_limited_queries) >= total_searches:
+            rate_limit_msg = (
+                "Stage failed at Retrieval: Wikipedia API rate limit reached (HTTP 429). "
+                f"Requests were throttled by Wikimedia across {len(rate_limited_queries)} search query(ies). "
+                "Please wait a moment before trying again."
+            )
+            errors.append(rate_limit_msg)
+            return ResearchResult({
+                "topic": cleaned_topic,
+                "questions": questions,
+                "sources": [],
+                "briefing": "",
+                "claims": [],
+                "verification_summary": {},
+                "warnings": warnings,
+                "errors": errors,
+                "formatted_report": rate_limit_msg,
+                "diagnostics": {
+                    "stage_failed": "rate_limited",
+                    "reason": "rate_limited",
+                    "questions_count": len(questions),
+                    "candidates_count": 0,
+                    "details": "All Wikipedia search requests were throttled by Wikimedia (HTTP 429) after retries.",
+                },
+            })
+        elif network_error_queries and (len(network_error_queries) + len(rate_limited_queries)) >= total_searches:
+            net_err_msg = (
+                "Stage failed at Retrieval: Could not retrieve usable source material from Wikipedia. "
+                "Network or search endpoint failure occurred while contacting Wikipedia."
+            )
+            errors.append(net_err_msg)
+            return ResearchResult({
+                "topic": cleaned_topic,
+                "questions": questions,
+                "sources": [],
+                "briefing": "",
+                "claims": [],
+                "verification_summary": {},
+                "warnings": warnings,
+                "errors": errors,
+                "formatted_report": net_err_msg,
+                "diagnostics": {
+                    "stage_failed": "retrieval",
+                    "reason": "network_failure",
+                    "questions_count": len(questions),
+                    "candidates_count": 0,
+                    "details": "Wikipedia searches encountered connection or endpoint errors.",
+                },
+            })
+        else:
+            no_sources_msg = (
+                f"Stage failed at Retrieval: Could not retrieve usable source material from Wikipedia. "
+                f"No matching Wikipedia articles were found across {len(questions)} search queries for topic '{cleaned_topic}'."
+            )
+            errors.append(no_sources_msg)
+            return ResearchResult({
+                "topic": cleaned_topic,
+                "questions": questions,
+                "sources": [],
+                "briefing": "",
+                "claims": [],
+                "verification_summary": {},
+                "warnings": warnings,
+                "errors": errors,
+                "formatted_report": no_sources_msg,
+                "diagnostics": {
+                    "stage_failed": "retrieval",
+                    "reason": "no_results",
+                    "questions_count": len(questions),
+                    "candidates_count": 0,
+                    "details": f"Wikipedia search returned no candidate pages for '{cleaned_topic}'.",
+                },
+            })
 
     notify("filtering", f"Filtering {len(candidate_sources)} candidates for topic relevance...")
 
@@ -228,6 +296,7 @@ def research_topic(
             "formatted_report": "Research stopped because source relevance could not be verified.",
             "diagnostics": {
                 "stage_failed": "relevance_filter",
+                "reason": "filter_error",
                 "questions_count": len(questions),
                 "candidates_count": len(candidate_sources),
                 "details": f"Relevance filtering error: {error}",
@@ -255,6 +324,7 @@ def research_topic(
             "formatted_report": no_rel_msg,
             "diagnostics": {
                 "stage_failed": "relevance_filter",
+                "reason": "relevance_rejected",
                 "questions_count": len(questions),
                 "candidates_count": len(candidate_sources),
                 "relevant_count": 0,
@@ -360,6 +430,7 @@ SOURCE MATERIAL:
         "formatted_report": formatted_report,
         "diagnostics": {
             "stage_failed": None,
+            "reason": "success",
             "questions_count": len(questions),
             "candidates_count": len(candidate_sources),
             "relevant_count": len(sources),

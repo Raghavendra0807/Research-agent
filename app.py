@@ -281,9 +281,20 @@ def run_pipeline(topic: str) -> None:
         )
         st.session_state["research_result"] = result
         if result.get("errors"):
-            failed_stage = result.get("diagnostics", {}).get("stage_failed", "pipeline")
+            diagnostics = result.get("diagnostics", {})
+            failed_stage = diagnostics.get("stage_failed", "pipeline")
+            reason = diagnostics.get("reason", "")
+            if failed_stage == "rate_limited" or reason == "rate_limited":
+                label = "⚠️ Research paused: Wikipedia rate limit reached (HTTP 429)"
+            elif reason == "network_failure":
+                label = "⚠️ Research stopped: Network connection error reaching Wikipedia"
+            elif reason == "no_results":
+                label = f"⚠️ Research stopped: No Wikipedia articles found for '{topic}'"
+            else:
+                label = f"⚠️ Research stopped: Insufficient evidence at stage '{failed_stage}'"
+
             status_container.update(
-                label=f"⚠️ Research stopped: Insufficient evidence at stage '{failed_stage}'",
+                label=label,
                 state="error",
                 expanded=True,
             )

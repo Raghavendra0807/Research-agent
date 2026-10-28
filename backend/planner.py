@@ -1,4 +1,3 @@
-
 import json
 from typing import Callable
 
@@ -22,22 +21,19 @@ You are a research planning assistant.
 The user wants to research this topic:
 {cleaned_topic}
 
-Generate exactly {count} short, distinct research questions that
-cover different important aspects of the topic.
+Generate exactly {count} short, distinct research questions that cover different core aspects of the topic:
+1. Definition & Core Purpose: What the topic is and its primary objective or nature.
+2. Architecture & Mechanisms: Its underlying structure, workflow model, or components (e.g., for software/frameworks: graph-based workflow model, nodes, edges, and state management; for science: biological, physical, or chemical mechanisms).
+3. Coordination & Practical Application: How it coordinates agents, tools, or processes in practical execution.
+4. Documented Capabilities & Limitations: Established capabilities, constraints, and limitations documented in technical or scientific sources.
 
-Requirements:
-- Keep every question focused and searchable on Wikipedia.
-- Avoid repeating the same idea.
-- Include foundational concepts and relevant applications or limitations.
+CRITICAL RULES:
+- Ground questions strictly in the topic's actual domain. Do not confuse software framework names with unrelated domains (e.g., do not assume an LLM orchestration tool like LangGraph is a knowledge graph database, graph neural network, or graph theory topic).
+- Do NOT generate speculative questions about bias, privacy, societal ethics, or real-time graph updates unless the topic fundamentally demands them.
+- Keep each question concise, direct, and focused on searchable factual concepts on Wikipedia.
 - Return ONLY a valid JSON object in this exact format:
-{{"questions": ["question 1", "question 2"]}}
-- Make each question cover a distinct aspect of the topic.
-- For questions about solutions, ask for evidence of effectiveness.
-- Prefer specific, searchable concepts over broad related topics.
-- Do not assume a particular solution works without evidence.
-- Include at least one question about limitations or unintended effects.
-
-The questions array must contain exactly {count} strings.
+{{"questions": ["question 1", "question 2", "question 3", "question 4"]}}
+The 'questions' array must contain exactly {count} plain strings. Do NOT wrap list items in objects or curly braces.
 Do not include Markdown fences or explanations.
 """
 
@@ -53,11 +49,16 @@ Do not include Markdown fences or explanations.
             raise ValueError("'questions' must be a list")
 
         # Keep only non-empty strings and cap the number of searches.
-        cleaned = [
-            question.strip()
-            for question in questions
-            if isinstance(question, str) and question.strip()
-        ]
+        cleaned = []
+        for question in questions:
+            if isinstance(question, str) and question.strip():
+                cleaned.append(question.strip())
+            elif isinstance(question, dict):
+                # Handle cases where model wrapped string in a dictionary
+                for val in question.values():
+                    if isinstance(val, str) and val.strip():
+                        cleaned.append(val.strip())
+                        break
 
         # Remove duplicates while preserving order.
         unique_questions = list(dict.fromkeys(cleaned))
@@ -89,4 +90,3 @@ if __name__ == "__main__":
             print(f"Planner failed: {error}")
     else:
         print("Please enter a topic.")
-

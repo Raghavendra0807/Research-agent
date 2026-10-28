@@ -15,7 +15,12 @@ from backend.planner import generate_research_questions
 from backend.relevance_filter import filter_relevant_sources
 from backend.research_agent import ResearchResult, research_topic
 from backend.verifier import generate_verification_summary, verify_briefing
-from backend.wikimedia_client import search_wikipedia
+from backend.wikimedia_client import (
+    WikimediaRateLimitError,
+    clear_summary_cache,
+    derive_search_query,
+    search_wikipedia,
+)
 
 
 class TestMistralClientConfiguration(unittest.TestCase):
@@ -174,6 +179,124 @@ class TestWikimediaResilience(unittest.TestCase):
         mock_session.get.side_effect = [search_resp, summary_resp]
         results = search_wikipedia("test topic", limit=1, session=mock_session)
         self.assertEqual(results, [])
+
+    def test_http_429_followed_by_successful_retry(self):
+        """Wikipedia returns HTTP 429 once, then succeeds on retry with backoff."""
+        mock_session = MagicMock()
+        mock_sleep = MagicMock()
+
+        # 1. 429 response
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+
+        # 2. 200 response for search
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.raise_for_status.return_value = None
+        resp_200.json.return_value = {"pages": [{"title": "Retried Article"}]}
+
+        # 3. 200 response for summary
+        summary_resp = MagicMock()
+        summary_resp.status_code = 200
+        summary_resp.raise_for_status.return_value = None
+        summary_resp.json.return_value = {
+            "extract": "Evidence from article fetched after 429 backoff.",
+            "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Retried"}},
+        }
+
+        mock_session.get.side_effect = [resp_429, resp_200, summary_resp]
+
+        results = search_wikipedia(
+            "LangGraph",
+            limit=1,
+            session=mock_session,
+            max_retries=2,
+            sleep_fn=mock_sleep,
+            pacing_delay=0.0,
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "Retried Article")
+        # Assert retry sleep occurred
+        self.assertTrue(mock_sleep.called)
+
+    def test_http_429_persisting_after_retry_limit(self):
+        """Wikipedia continually returns HTTP 429, raising WikimediaRateLimitError after retries exhausted."""
+        mock_session = MagicMock()
+        mock_sleep = MagicMock()
+
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+        mock_session.get.return_value = resp_429
+
+        with self.assertRaises(WikimediaRateLimitError) as ctx:
+            search_wikipedia(
+                "LangGraph",
+                limit=1,
+                session=mock_session,
+                max_retries=2,
+                sleep_fn=mock_sleep,
+                pacing_delay=0.0,
+            )
+
+        self.assertIn("rate limited (HTTP 429)", str(ctx.exception))
+        # Verify bounded retry count: exactly 2 retry sleeps
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    def test_respect_retry_after_header_without_real_delays(self):
+        """HTTP 429 with 'Retry-After' header delays exactly by the specified seconds without stalling tests."""
+        mock_session = MagicMock()
+        mock_sleep = MagicMock()
+
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "3.5"}
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.raise_for_status.return_value = None
+        resp_200.json.return_value = {"pages": [{"title": "Article"}]}
+
+        summary_resp = MagicMock()
+        summary_resp.status_code = 200
+        summary_resp.raise_for_status.return_value = None
+        summary_resp.json.return_value = {
+            "extract": "Content.",
+            "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Article"}},
+        }
+
+        mock_session.get.side_effect = [resp_429, resp_200, summary_resp]
+
+        search_wikipedia(
+            "LangGraph",
+            limit=1,
+            session=mock_session,
+            max_retries=1,
+            sleep_fn=mock_sleep,
+            pacing_delay=0.0,
+        )
+
+        mock_sleep.assert_called_with(3.5)
+
+    def test_derive_search_query_concise_langgraph(self):
+        """Conversational research questions for LangGraph are condensed into concise, topic-focused queries."""
+        q1 = "What is LangGraph and how does it define its primary purpose in agentic workflows?"
+        q2 = "How does LangGraph's graph-based workflow model use nodes, edges, and state?"
+        q3 = "In what ways does LangGraph coordinate LLM-powered agents and tools?"
+        q4 = "What are the documented capabilities and limitations of LangGraph in production?"
+
+        query1 = derive_search_query(q1, "LangGraph")
+        query2 = derive_search_query(q2, "LangGraph")
+        query3 = derive_search_query(q3, "LangGraph")
+        query4 = derive_search_query(q4, "LangGraph")
+
+        for q, query in [(q1, query1), (q2, query2), (q3, query3), (q4, query4)]:
+            self.assertIn("LangGraph", query)
+            self.assertLessEqual(len(query.split()), 6)
+            self.assertFalse(query.lower().startswith("what is"))
+            self.assertFalse(query.lower().startswith("how does"))
 
 
 class TestPipelineResilience(unittest.TestCase):
@@ -434,7 +557,84 @@ class TestPipelineDiagnosticsAndEvidence(unittest.TestCase):
         self.assertEqual(result_malformed["diagnostics"]["stage_failed"], "retrieval")
         self.assertTrue(any("Could not retrieve usable source material" in err for err in result_malformed["errors"]))
 
+    def test_partial_search_failure_preserves_successful_results(self):
+        """When one search query encounters rate-limiting or errors, successful results from other queries are preserved."""
+        def mock_ask(prompt: str) -> str:
+            if "Generate exactly" in prompt:
+                return json.dumps({"questions": ["Q1: Success", "Q2: RateLimit", "Q3: Success"]})
+            elif "Select up to" in prompt:
+                return json.dumps({"selected_ids": ["C1", "C2"]})
+            elif "Extract up to 8 important" in prompt:
+                return json.dumps({"claims": ["Fact supported by surviving sources [S1]."]})
+            elif "fact-checking assistant" in prompt:
+                return json.dumps({
+                    "verdict": "supported",
+                    "explanation": "Supported by text.",
+                    "source_ids": ["S1"],
+                    "supporting_excerpt": "Valid evidence text",
+                })
+            else:
+                return "# Executive Summary\nFact supported by surviving sources [S1]."
+
+        def mock_mixed_search(query: str, limit: int = 2) -> list[dict]:
+            if "RateLimit" in query:
+                raise WikimediaRateLimitError("Throttled query Q2")
+            return [
+                {
+                    "title": f"Source for {query}",
+                    "url": f"https://en.wikipedia.org/wiki/{query.replace(' ', '_')}",
+                    "text": f"Valid evidence text from {query}.",
+                }
+            ]
+
+        result = research_topic("Resilient Topic", ask_fn=mock_ask, search_fn=mock_mixed_search)
+
+        self.assertIsInstance(result, ResearchResult)
+        # Verify that successful results from Q1 and Q3 were preserved and synthesized
+        self.assertEqual(len(result["sources"]), 2)
+        self.assertEqual(len(result["errors"]), 0)
+        self.assertIsNone(result["diagnostics"]["stage_failed"])
+        self.assertEqual(result["diagnostics"]["reason"], "success")
+        self.assertIn("Fact supported by surviving sources", result["briefing"])
+        # Verify warning was recorded for the rate-limited query
+        self.assertTrue(any("rate limit" in w.lower() for w in result["warnings"]))
+
+    def test_persistent_rate_limiting_diagnosed_accurately(self):
+        """When all searches fail due to rate-limiting, diagnose rate_limited instead of claiming lack of coverage."""
+        def mock_ask(prompt: str) -> str:
+            return json.dumps({"questions": ["Q1", "Q2"]})
+
+        def mock_rate_limited_search(query: str, limit: int = 2) -> list[dict]:
+            raise WikimediaRateLimitError("429 Client Error: Too Many Requests")
+
+        result = research_topic("Rate Limited Topic", ask_fn=mock_ask, search_fn=mock_rate_limited_search)
+
+        self.assertEqual(len(result["sources"]), 0)
+        self.assertEqual(result["diagnostics"]["stage_failed"], "rate_limited")
+        self.assertEqual(result["diagnostics"]["reason"], "rate_limited")
+        # Informative error message distinguishing rate-limiting
+        self.assertTrue(any("rate limit reached (HTTP 429)" in err for err in result["errors"]))
+        # Never misreport rate limiting as lack of Wikipedia content
+        self.assertFalse(any("Wikipedia may lack an established article" in err for err in result["errors"]))
+
+    def test_no_results_distinguished_from_relevance_rejection(self):
+        """Distinguish zero search results from candidate articles being rejected by relevance filtering."""
+        def mock_ask(prompt: str) -> str:
+            return json.dumps({"questions": ["Q1", "Q2"]})
+
+        # Search succeeds (HTTP 200) but finds 0 articles
+        def mock_empty_search(query: str, limit: int = 2) -> list[dict]:
+            return []
+
+        result = research_topic("Obscure Query", ask_fn=mock_ask, search_fn=mock_empty_search)
+
+        self.assertEqual(len(result["sources"]), 0)
+        self.assertEqual(result["diagnostics"]["stage_failed"], "retrieval")
+        self.assertEqual(result["diagnostics"]["reason"], "no_results")
+        self.assertTrue(any("No matching Wikipedia articles were found" in err for err in result["errors"]))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
