@@ -163,6 +163,66 @@ class TestStage3AppIntegration(unittest.TestCase):
             self.assertTrue(mock_error.called)
             self.assertIn("S9", str(mock_error.call_args))
 
+    def test_render_diagnostics_displays_stage_failure_safely(self):
+        """Confirm render_diagnostics expands and safely shows failed stage and candidate count."""
+        import app
+
+        diagnostics = {
+            "stage_failed": "relevance_filter",
+            "details": "Evaluated 8 candidate article(s), but none met strict relevance criteria.",
+            "questions_count": 4,
+            "candidates_count": 8,
+            "candidate_titles": ["LangChain", "DOT", "Java"],
+        }
+
+        mock_expander = MagicMock()
+        mock_expander.return_value.__enter__.return_value = MagicMock()
+        with patch("streamlit.expander", mock_expander), \
+             patch("streamlit.markdown") as mock_markdown:
+            app.render_diagnostics(diagnostics)
+            self.assertTrue(mock_expander.called)
+            expander_title = str(mock_expander.call_args)
+            self.assertIn("relevance_filter", expander_title)
+            # Confirm markdown received stage and counts
+            markdown_calls = [str(call) for call in mock_markdown.call_args_list]
+            self.assertTrue(any("relevance_filter" in c for c in markdown_calls))
+            self.assertTrue(any("8" in c for c in markdown_calls))
+
+    def test_render_results_with_diagnostics_on_early_failure(self):
+        """Confirm render_results renders plan, diagnostics, and warnings/errors when research fails early."""
+        import app
+
+        failing_result = ResearchResult({
+            "topic": "LangGraph",
+            "questions": ["What is LangGraph?"],
+            "sources": [],
+            "briefing": "",
+            "claims": [],
+            "verification_summary": {},
+            "warnings": [],
+            "errors": ["Stage failed at Relevance Filtering: No sufficiently relevant sources were found."],
+            "formatted_report": "Error report",
+            "diagnostics": {
+                "stage_failed": "relevance_filter",
+                "details": "None of the candidates had evidence.",
+                "questions_count": 1,
+                "candidates_count": 2,
+            },
+        })
+
+        mock_expander = MagicMock()
+        mock_expander.return_value.__enter__.return_value = MagicMock()
+        with patch("streamlit.expander", mock_expander), \
+             patch("streamlit.markdown") as mock_markdown, \
+             patch("streamlit.error") as mock_error:
+            app.render_results(failing_result)
+            # Verify error was rendered
+            self.assertTrue(mock_error.called)
+            self.assertIn("Relevance Filtering", str(mock_error.call_args))
+            # Verify diagnostics expander was rendered
+            self.assertTrue(mock_expander.called)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -295,5 +295,146 @@ class TestPipelineResilience(unittest.TestCase):
         self.assertTrue(any("UNSUPPORTED claim" in w for w in summary["warnings"]))
 
 
+class TestPipelineDiagnosticsAndEvidence(unittest.TestCase):
+    """
+    Mocked test suite verifying diagnostic reporting and evidence integrity across:
+    1. A topic with relevant Wikipedia articles.
+    2. A topic with genuinely insufficient evidence on Wikipedia (e.g., LangGraph).
+    3. Malformed and empty search results.
+    """
+
+    def test_topic_with_relevant_wikipedia_articles(self):
+        """Pipeline successfully completes with rich diagnostics when evidence is present."""
+        def mock_ask(prompt: str) -> str:
+            if "Generate exactly" in prompt:
+                return json.dumps({
+                    "questions": [
+                        "How does CRISPR-Cas9 work?",
+                        "What are applications of CRISPR gene editing?",
+                    ]
+                })
+            elif "Select up to" in prompt:
+                return json.dumps({"selected_ids": ["C1"]})
+            elif "Extract up to 8 important" in prompt:
+                return json.dumps({"claims": ["CRISPR-Cas9 enables targeted genome editing [S1]."]})
+            elif "fact-checking assistant" in prompt:
+                return json.dumps({
+                    "verdict": "supported",
+                    "explanation": "Extract explicitly confirms genome editing mechanism.",
+                    "source_ids": ["S1"],
+                    "supporting_excerpt": "targeted genome editing technology",
+                })
+            else:
+                return "# Executive Summary\nCRISPR-Cas9 enables targeted genome editing [S1]."
+
+        def mock_search(query: str, limit: int = 2) -> list[dict]:
+            return [
+                {
+                    "title": "CRISPR gene editing",
+                    "url": "https://en.wikipedia.org/wiki/CRISPR_gene_editing",
+                    "text": "CRISPR-Cas9 is a targeted genome editing technology derived from bacterial immune systems.",
+                }
+            ]
+
+        result = research_topic("CRISPR gene editing", ask_fn=mock_ask, search_fn=mock_search)
+
+        self.assertIsInstance(result, ResearchResult)
+        self.assertEqual(len(result["errors"]), 0)
+        self.assertIsNone(result["diagnostics"]["stage_failed"])
+        self.assertEqual(result["diagnostics"]["questions_count"], 2)
+        self.assertEqual(result["diagnostics"]["relevant_count"], 1)
+        self.assertEqual(len(result["sources"]), 1)
+        self.assertIn("CRISPR-Cas9", result["briefing"])
+        self.assertEqual(len(result["claims"]), 1)
+        self.assertEqual(result["claims"][0]["verdict"], "supported")
+
+    def test_topic_with_genuinely_insufficient_evidence(self):
+        """
+        When Wikipedia lacks coverage/evidence (e.g. LangGraph), the pipeline must:
+        - Preserve evidence-based filtering: reject irrelevant sources (do NOT accept them just to succeed).
+        - Not fabricate evidence or briefings.
+        - Accurately diagnose failure at the relevance_filter stage.
+        """
+        def mock_ask(prompt: str) -> str:
+            if "Generate exactly" in prompt:
+                return json.dumps({
+                    "questions": [
+                        "What is LangGraph and how does it manage state?",
+                        "What are the limitations of LangGraph in production?",
+                    ]
+                })
+            elif "Select up to" in prompt:
+                # The strict relevance evaluator correctly rejects candidates lacking evidence
+                return json.dumps({"selected_ids": []})
+            else:
+                raise AssertionError(f"Unexpected ask call after filter failure: {prompt[:100]}")
+
+        def mock_search(query: str, limit: int = 2) -> list[dict]:
+            # Wikipedia search returns only tangential or unrelated pages without LangGraph evidence
+            return [
+                {
+                    "title": "DOT (graph description language)",
+                    "url": "https://en.wikipedia.org/wiki/DOT_(graph_description_language)",
+                    "text": "DOT is a plain text graph description language developed for Graphviz.",
+                },
+                {
+                    "title": "Java (programming language)",
+                    "url": "https://en.wikipedia.org/wiki/Java_(programming_language)",
+                    "text": "Java is a class-based, object-oriented computer programming language.",
+                },
+            ]
+
+        result = research_topic("LangGraph", ask_fn=mock_ask, search_fn=mock_search)
+
+        self.assertIsInstance(result, ResearchResult)
+        # Evidence-based filtering preserved: no irrelevant sources admitted
+        self.assertEqual(len(result["sources"]), 0)
+        self.assertEqual(result["briefing"], "")
+        self.assertEqual(len(result["claims"]), 0)
+
+        # Stage failure accurately diagnosed
+        self.assertEqual(result["diagnostics"]["stage_failed"], "relevance_filter")
+        self.assertEqual(result["diagnostics"]["questions_count"], 2)
+        self.assertGreaterEqual(result["diagnostics"]["candidates_count"], 2)
+        self.assertEqual(result["diagnostics"]["relevant_count"], 0)
+        self.assertIn("DOT (graph description language)", result["diagnostics"]["candidate_titles"])
+
+        # Error message clearly identifies failure stage and provides diagnostic explanation
+        self.assertTrue(any("Relevance Filtering" in err for err in result["errors"]))
+        self.assertTrue(any("No sufficiently relevant sources were found" in err for err in result["errors"]))
+        self.assertIn("Relevance Filtering", result["formatted_report"])
+
+    def test_malformed_and_empty_search_results(self):
+        """Pipeline safely handles empty or malformed search payloads without uncaught exceptions."""
+        def mock_ask(prompt: str) -> str:
+            return json.dumps({"questions": ["Q1", "Q2"]})
+
+        # Test case A: Search returns empty list
+        def mock_empty_search(query: str, limit: int = 2) -> list[dict]:
+            return []
+
+        result_empty = research_topic("Empty Topic", ask_fn=mock_ask, search_fn=mock_empty_search)
+        self.assertEqual(len(result_empty["sources"]), 0)
+        self.assertEqual(result_empty["diagnostics"]["stage_failed"], "retrieval")
+        self.assertTrue(any("Could not retrieve usable source material" in err for err in result_empty["errors"]))
+
+        # Test case B: Search returns malformed elements (non-dict, empty text/title, bad types)
+        def mock_malformed_search(query: str, limit: int = 2) -> list:
+            return [
+                None,
+                "unexpected-string",
+                12345,
+                {"title": "", "text": "missing title"},
+                {"title": "No text", "text": "   "},
+                {"bad_keys": True},
+            ]
+
+        result_malformed = research_topic("Malformed Topic", ask_fn=mock_ask, search_fn=mock_malformed_search)
+        self.assertEqual(len(result_malformed["sources"]), 0)
+        self.assertEqual(result_malformed["diagnostics"]["stage_failed"], "retrieval")
+        self.assertTrue(any("Could not retrieve usable source material" in err for err in result_malformed["errors"]))
+
+
 if __name__ == "__main__":
     unittest.main()
+

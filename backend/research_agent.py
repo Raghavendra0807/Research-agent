@@ -105,6 +105,10 @@ def research_topic(
             "warnings": [empty_msg],
             "errors": [empty_msg],
             "formatted_report": empty_msg,
+            "diagnostics": {
+                "stage_failed": "input_validation",
+                "details": empty_msg,
+            },
         })
 
     notify("planning", f"Planning research questions for: {cleaned_topic}")
@@ -116,7 +120,7 @@ def research_topic(
     try:
         questions = generate_research_questions(cleaned_topic, count=4, ask_fn=ask_fn)
     except Exception as error:
-        err_msg = f"Failed to generate research plan: {error}"
+        err_msg = f"Stage failed at Planning: Failed to generate research plan: {error}"
         errors.append(err_msg)
         return ResearchResult({
             "topic": cleaned_topic,
@@ -128,6 +132,10 @@ def research_topic(
             "warnings": warnings,
             "errors": errors,
             "formatted_report": f"Research failed during planning: {error}",
+            "diagnostics": {
+                "stage_failed": "planning",
+                "details": str(error),
+            },
         })
 
     notify("planning_complete", f"Formulated {len(questions)} research questions.")
@@ -143,10 +151,23 @@ def research_topic(
             warnings.append(f"Search failed for query '{question}': {error}")
             continue
 
+        if not isinstance(results, list):
+            continue
+
         for source in results:
-            title = source.get("title", "").strip()
+            if not isinstance(source, dict):
+                continue
+
+            title = source.get("title", "")
             url = source.get("url", "")
-            text = source.get("text", "").strip()
+            text = source.get("text", "")
+
+            if not isinstance(title, str) or not isinstance(text, str):
+                continue
+
+            title = title.strip()
+            text = text.strip()
+            url = url.strip() if isinstance(url, str) else ""
 
             if not title or not text:
                 continue
@@ -162,7 +183,7 @@ def research_topic(
     candidate_sources = list(unique_sources.values())
 
     if not candidate_sources:
-        no_sources_msg = "Could not retrieve usable source material from Wikipedia. Please try another topic."
+        no_sources_msg = "Stage failed at Retrieval: Could not retrieve usable source material from Wikipedia. Please try another topic."
         errors.append(no_sources_msg)
         return ResearchResult({
             "topic": cleaned_topic,
@@ -174,6 +195,12 @@ def research_topic(
             "warnings": warnings,
             "errors": errors,
             "formatted_report": no_sources_msg,
+            "diagnostics": {
+                "stage_failed": "retrieval",
+                "questions_count": len(questions),
+                "candidates_count": 0,
+                "details": "Wikipedia search returned no usable article extracts across all formulated research questions.",
+            },
         })
 
     notify("filtering", f"Filtering {len(candidate_sources)} candidates for topic relevance...")
@@ -187,7 +214,7 @@ def research_topic(
             ask_fn=ask_fn,
         )
     except Exception as error:
-        err_msg = f"Relevance filtering failed: {error}"
+        err_msg = f"Stage failed at Relevance Filtering: Relevance filtering failed: {error}"
         errors.append(err_msg)
         return ResearchResult({
             "topic": cleaned_topic,
@@ -199,10 +226,22 @@ def research_topic(
             "warnings": warnings,
             "errors": errors,
             "formatted_report": "Research stopped because source relevance could not be verified.",
+            "diagnostics": {
+                "stage_failed": "relevance_filter",
+                "questions_count": len(questions),
+                "candidates_count": len(candidate_sources),
+                "details": f"Relevance filtering error: {error}",
+            },
         })
 
     if not sources:
-        no_rel_msg = "No sufficiently relevant sources were found. Try a more specific topic."
+        notify("filtering_failed", f"No sufficiently relevant sources found for '{cleaned_topic}'.")
+        no_rel_msg = (
+            f"Stage failed at Relevance Filtering: No sufficiently relevant sources were found. "
+            f"Evaluated {len(candidate_sources)} candidate article(s) from Wikipedia across {len(questions)} research questions, "
+            f"but none contained sufficient evidence directly addressing '{cleaned_topic}'. "
+            f"Wikipedia may lack an established article or coverage for this topic; try a broader topic or one with dedicated Wikipedia articles."
+        )
         errors.append(no_rel_msg)
         return ResearchResult({
             "topic": cleaned_topic,
@@ -214,6 +253,17 @@ def research_topic(
             "warnings": warnings,
             "errors": errors,
             "formatted_report": no_rel_msg,
+            "diagnostics": {
+                "stage_failed": "relevance_filter",
+                "questions_count": len(questions),
+                "candidates_count": len(candidate_sources),
+                "relevant_count": 0,
+                "candidate_titles": [s.get("title", "") for s in candidate_sources[:10]],
+                "details": (
+                    f"Evaluated {len(candidate_sources)} candidate article(s), but none met strict relevance "
+                    f"criteria for '{cleaned_topic}'."
+                ),
+            },
         })
 
     # Assign stable source IDs and package evidence context
@@ -308,6 +358,13 @@ SOURCE MATERIAL:
         "warnings": warnings,
         "errors": errors,
         "formatted_report": formatted_report,
+        "diagnostics": {
+            "stage_failed": None,
+            "questions_count": len(questions),
+            "candidates_count": len(candidate_sources),
+            "relevant_count": len(sources),
+            "claims_count": len(claims),
+        },
     })
 
 

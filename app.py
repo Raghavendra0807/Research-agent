@@ -179,6 +179,29 @@ def render_verification_dashboard(claims: list[dict], summary: dict) -> None:
                 )
 
 
+def render_diagnostics(diagnostics: dict) -> None:
+    """Render concise, safe pipeline stage diagnostic details without exposing secrets."""
+    if not diagnostics or not diagnostics.get("stage_failed"):
+        return
+
+    stage_failed = diagnostics.get("stage_failed", "unknown")
+    details = diagnostics.get("details", "")
+    candidates_count = diagnostics.get("candidates_count")
+    questions_count = diagnostics.get("questions_count")
+    candidate_titles = diagnostics.get("candidate_titles", [])
+
+    with st.expander(f"🔍 Pipeline Diagnostics (Stage Failed: {stage_failed})", expanded=True):
+        st.markdown(f"**Failed Pipeline Stage:** `{stage_failed}`")
+        if details:
+            st.markdown(f"**Diagnostic Details:** {details}")
+        if questions_count is not None:
+            st.markdown(f"**Research Questions Formulated:** {questions_count}")
+        if candidates_count is not None:
+            st.markdown(f"**Wikipedia Articles Evaluated:** {candidates_count}")
+        if candidate_titles:
+            st.markdown(f"**Candidate Page Titles Checked:** {', '.join(candidate_titles[:6])}")
+
+
 def render_warnings_and_errors(warnings: list[str], errors: list[str]) -> None:
     """Display any operational warnings or pipeline errors."""
     if errors:
@@ -200,9 +223,13 @@ def render_results(result: ResearchResult) -> None:
     claims = result.get("claims", [])
     summary = result.get("verification_summary", {})
     warnings = result.get("warnings", [])
+    diagnostics = result.get("diagnostics", {})
 
     # If fatal error occurred during early stage with no content
     if errors and not sources and not briefing:
+        if questions:
+            render_research_plan(questions)
+        render_diagnostics(diagnostics)
         render_warnings_and_errors(warnings, errors)
         return
 
@@ -239,6 +266,7 @@ def run_pipeline(topic: str) -> None:
             "planning_complete": "📋",
             "retrieval": "🌐",
             "filtering": "⚖️",
+            "filtering_failed": "⚠️",
             "synthesis": "✍️",
             "verification": "🔍",
             "complete": "✅",
@@ -252,7 +280,15 @@ def run_pipeline(topic: str) -> None:
             progress_callback=progress_callback,
         )
         st.session_state["research_result"] = result
-        status_container.update(label="✅ Research and claim verification complete!", state="complete", expanded=False)
+        if result.get("errors"):
+            failed_stage = result.get("diagnostics", {}).get("stage_failed", "pipeline")
+            status_container.update(
+                label=f"⚠️ Research stopped: Insufficient evidence at stage '{failed_stage}'",
+                state="error",
+                expanded=True,
+            )
+        else:
+            status_container.update(label="✅ Research and claim verification complete!", state="complete", expanded=False)
     except Exception as exc:
         status_container.update(label="❌ Research encountered an error", state="error", expanded=True)
         st.session_state["pipeline_error"] = str(exc)
